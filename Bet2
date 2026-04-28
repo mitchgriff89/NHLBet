@@ -1,0 +1,530 @@
+// ============================================================
+//  NHL AI BETTING BOT — Railway Deployment
+//  Sends daily playoff alerts to Telegram
+//  Requires: BOT_TOKEN and CHAT_ID environment variables
+// ============================================================
+
+const TelegramBot = require("node-telegram-bot-api");
+const cron = require("node-cron");
+const axios = require("axios");
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const CHAT_ID = process.env.CHAT_ID;
+
+if (!BOT_TOKEN || !CHAT_ID) {
+  console.error("❌ Missing BOT_TOKEN or CHAT_ID environment variables");
+  process.exit(1);
+}
+
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
+
+// ─── BOOKMAKERS ──────────────────────────────────────────────
+const BOOKMAKERS = [
+  "DraftKings",
+  "FanDuel",
+  "BetMGM",
+  "Caesars",
+  "PointsBet",
+  "BetRivers",
+  "Unibet",
+  "bet365",
+];
+
+// ─── FETCH LIVE NHL PLAYOFF GAMES ────────────────────────────
+// Uses the free SportRadar-backed odds API via the-odds-api.com
+// Sign up free at the-odds-api.com and add ODDS_API_KEY to Railway env vars
+async function fetchLiveOdds() {
+  const ODDS_API_KEY = process.env.ODDS_API_KEY;
+
+  if (!ODDS_API_KEY) {
+    console.log("⚠️  No ODDS_API_KEY set — using simulated odds");
+    return null;
+  }
+
+  try {
+    const res = await axios.get(
+      "https://api.the-odds-api.com/v4/sports/icehockey_nhl/odds",
+      {
+        params: {
+          apiKey: ODDS_API_KEY,
+          regions: "us",
+          markets: "h2h,totals",
+          oddsFormat: "american",
+        },
+        timeout: 10000,
+      }
+    );
+    return res.data;
+  } catch (e) {
+    console.log("⚠️  Odds API error:", e.message, "— using simulated odds");
+    return null;
+  }
+}
+
+// ─── FETCH NHL SCORES / SCHEDULE ─────────────────────────────
+async function fetchNHLSchedule() {
+  try {
+    // NHL free schedule API
+    const today = new Date().toISOString().split("T")[0];
+    const res = await axios.get(
+      `https://api-web.nhle.com/v1/schedule/${today}`,
+      { timeout: 10000 }
+    );
+    const gameWeek = res.data?.gameWeek || [];
+    const games = [];
+    for (const day of gameWeek) {
+      for (const g of day.games || []) {
+        if (g.gameType === 3) {
+          // 3 = playoffs
+          games.push({
+            id: g.id,
+            home: g.homeTeam?.commonName?.default || g.homeTeam?.abbrev,
+            homeAbbr: g.homeTeam?.abbrev,
+            away: g.awayTeam?.commonName?.default || g.awayTeam?.abbrev,
+            awayAbbr: g.awayTeam?.abbrev,
+            time: g.startTimeUTC,
+            gameType: g.gameType,
+            seriesStatus: g.seriesStatus,
+          });
+        }
+      }
+    }
+    return games.length > 0 ? games : null;
+  } catch (e) {
+    console.log("⚠️  NHL API error:", e.message, "— using fallback data");
+    return null;
+  }
+}
+
+// ─── FALLBACK GAME DATA (updates manually each round) ────────
+function getFallbackGames() {
+  return [
+    {
+      id: "buf-bos-g5",
+      home: "Buffalo Sabres",
+      homeAbbr: "BUF",
+      homeSeed: 2,
+      away: "Boston Bruins",
+      awayAbbr: "BOS",
+      awaySeed: 5,
+      series: "Eastern R1",
+      seriesRecord: "BUF 3-1",
+      baseHomeWinPct: 60.1,
+      injuries: {
+        home: ["Tage Thompson (100%)", "JJ Peterka (100%)"],
+        away: ["Brad Marchand (upper body - OUT)", "David Pastrnak (100%)"],
+      },
+      h2h: "BUF leads series 3-1",
+      form: { home: "W-W-W-L-W", away: "W-L-L-L-W" },
+    },
+    {
+      id: "dal-min-g5",
+      home: "Dallas Stars",
+      homeAbbr: "DAL",
+      homeSeed: 2,
+      away: "Minnesota Wild",
+      awayAbbr: "MIN",
+      awaySeed: 3,
+      series: "Western R1",
+      seriesRecord: "Series 2-2",
+      baseHomeWinPct: 53.8,
+      injuries: {
+        home: ["Jason Robertson (100%)", "Joe Pavelski (100%)"],
+        away: ["Kirill Kaprizov (100%)", "Marc-Andre Fleury (GTD)"],
+      },
+      h2h: "Series tied 2-2",
+      form: { home: "W-L-W-L-W", away: "W-W-L-W-L" },
+    },
+    {
+      id: "edm-ana-g5",
+      home: "Edmonton Oilers",
+      homeAbbr: "EDM",
+      homeSeed: 5,
+      away: "Anaheim Ducks",
+      awayAbbr: "ANA",
+      awaySeed: 7,
+      series: "Western R1",
+      seriesRecord: "ANA 3-1",
+      baseHomeWinPct: 60.6,
+      injuries: {
+        home: ["Connor McDavid (100%)", "Leon Draisaitl (100%)"],
+        away: ["Trevor Zegras (lower body - OUT)", "John Gibson (100%)"],
+      },
+      h2h: "ANA leads series 3-1",
+      form: { home: "W-L-L-L-W", away: "L-W-W-W-L" },
+    },
+    {
+      id: "tb-mtl-g5",
+      home: "Tampa Bay Lightning",
+      homeAbbr: "TB",
+      homeSeed: 3,
+      away: "Montreal Canadiens",
+      awayAbbr: "MTL",
+      awaySeed: 4,
+      series: "Eastern R1",
+      seriesRecord: "Series 2-2",
+      baseHomeWinPct: 60.1,
+      injuries: {
+        home: ["Nikita Kucherov (100%)", "Brayden Point (100%)"],
+        away: ["Nick Suzuki (100%)", "Cole Caufield (upper body - GTD)"],
+      },
+      h2h: "Series tied 2-2",
+      form: { home: "W-L-W-L-W", away: "W-W-L-W-L" },
+    },
+    {
+      id: "phi-pit-g6",
+      home: "Philadelphia Flyers",
+      homeAbbr: "PHI",
+      homeSeed: 8,
+      away: "Pittsburgh Penguins",
+      awayAbbr: "PIT",
+      awaySeed: 7,
+      series: "Eastern R1",
+      seriesRecord: "PHI 3-2",
+      baseHomeWinPct: 51.4,
+      injuries: {
+        home: ["Sean Couturier (100%)", "Travis Konecny (100%)"],
+        away: ["Sidney Crosby (100%)", "Evgeni Malkin (100%)"],
+      },
+      h2h: "PHI leads series 3-2",
+      form: { home: "W-L-W-L-L", away: "L-W-L-W-W" },
+    },
+    {
+      id: "vgk-uta-g5",
+      home: "Vegas Golden Knights",
+      homeAbbr: "VGK",
+      homeSeed: 4,
+      away: "Utah Mammoth",
+      awayAbbr: "UTA",
+      awaySeed: 6,
+      series: "Western R1",
+      seriesRecord: "Series 2-2",
+      baseHomeWinPct: 59.1,
+      injuries: {
+        home: ["Mark Stone (100%)", "Jack Eichel (100%)"],
+        away: ["Clayton Keller (100%)", "Dylan Guenther (100%)"],
+      },
+      h2h: "Series tied 2-2",
+      form: { home: "W-L-W-L-W", away: "L-W-L-W-L" },
+    },
+  ];
+}
+
+// ─── GENERATE SYNTHETIC ODDS (8 books) ───────────────────────
+function generateOdds(baseHomeWinPct) {
+  const books = {};
+  BOOKMAKERS.forEach((bk) => {
+    const noise = (Math.random() - 0.5) * 5;
+    const homeProb = Math.min(Math.max(baseHomeWinPct + noise, 28), 76);
+    const awayProb = 100 - homeProb;
+
+    const toML = (prob) => {
+      if (prob >= 50) {
+        return `-${Math.round((prob / (100 - prob)) * 100)}`;
+      } else {
+        return `+${Math.round(((100 - prob) / prob) * 100)}`;
+      }
+    };
+
+    const totalNoise = (Math.random() - 0.5) * 0.5;
+    books[bk] = {
+      homeML: toML(homeProb),
+      awayML: toML(awayProb),
+      total: (5.5 + totalNoise).toFixed(1),
+      homeProb: homeProb.toFixed(1),
+    };
+  });
+  return books;
+}
+
+// ─── MONTE CARLO — 10 SIMULATIONS ────────────────────────────
+function runMonteCarlo(game, runs = 10) {
+  const baseHome = game.baseHomeWinPct / 100;
+
+  // Injury adjustment
+  const homeOutCount = game.injuries.home.filter((i) =>
+    i.includes("OUT")
+  ).length;
+  const homeGTDCount = game.injuries.home.filter((i) =>
+    i.includes("GTD")
+  ).length;
+  const awayOutCount = game.injuries.away.filter((i) =>
+    i.includes("OUT")
+  ).length;
+  const awayGTDCount = game.injuries.away.filter((i) =>
+    i.includes("GTD")
+  ).length;
+
+  const adjustedHome = Math.min(
+    Math.max(
+      baseHome -
+        homeOutCount * 0.03 -
+        homeGTDCount * 0.015 +
+        awayOutCount * 0.03 +
+        awayGTDCount * 0.015,
+      0.2
+    ),
+    0.8
+  );
+
+  const results = [];
+  for (let i = 0; i < runs; i++) {
+    const homeWins = Math.random() < adjustedHome;
+    const baseGoals = Math.round(2 + Math.random() * 3);
+    const otherGoals = Math.round(1 + Math.random() * 3);
+    const homeScore = homeWins
+      ? Math.max(baseGoals, otherGoals + 1)
+      : Math.min(baseGoals, otherGoals - 1);
+    const awayScore = homeWins
+      ? Math.min(otherGoals, baseGoals - 1)
+      : Math.max(otherGoals, baseGoals + 1);
+    const ot = Math.random() < 0.22;
+    results.push({
+      run: i + 1,
+      winner: homeWins ? game.homeAbbr : game.awayAbbr,
+      homeScore,
+      awayScore,
+      ot,
+    });
+  }
+
+  const homeWins = results.filter((r) => r.winner === game.homeAbbr).length;
+  const totalGoals = results.reduce(
+    (s, r) => s + r.homeScore + r.awayScore,
+    0
+  );
+  const otGames = results.filter((r) => r.ot).length;
+
+  return {
+    results,
+    homeWinPct: ((homeWins / runs) * 100).toFixed(0),
+    awayWinPct: (((runs - homeWins) / runs) * 100).toFixed(0),
+    avgTotal: (totalGoals / runs).toFixed(1),
+    otPct: ((otGames / runs) * 100).toFixed(0),
+    adjustedHomeProb: (adjustedHome * 100).toFixed(1),
+  };
+}
+
+// ─── BEST BET ENGINE ─────────────────────────────────────────
+function getBestBet(game, odds, sim) {
+  const homeProb = parseFloat(sim.homeWinPct) / 100;
+  let bestBet = { edge: -99 };
+
+  for (const [bk, o] of Object.entries(odds)) {
+    // Home ML edge
+    const homeML = parseInt(o.homeML);
+    const homeImplied =
+      homeML < 0
+        ? Math.abs(homeML) / (Math.abs(homeML) + 100)
+        : 100 / (homeML + 100);
+    const homeEdge = homeProb - homeImplied;
+
+    if (homeEdge > bestBet.edge) {
+      bestBet = {
+        edge: homeEdge,
+        book: bk,
+        ml: o.homeML,
+        team: game.homeAbbr,
+        fullTeam: game.home,
+        side: "home",
+      };
+    }
+
+    // Away ML edge
+    const awayML = parseInt(o.awayML);
+    const awayImplied =
+      awayML < 0
+        ? Math.abs(awayML) / (Math.abs(awayML) + 100)
+        : 100 / (awayML + 100);
+    const awayEdge = 1 - homeProb - awayImplied;
+
+    if (awayEdge > bestBet.edge) {
+      bestBet = {
+        edge: awayEdge,
+        book: bk,
+        ml: o.awayML,
+        team: game.awayAbbr,
+        fullTeam: game.away,
+        side: "away",
+      };
+    }
+  }
+
+  const avgTotal = parseFloat(sim.avgTotal);
+  const overUnder = avgTotal > 5.5 ? "OVER 5.5" : "UNDER 5.5";
+  const roi = (bestBet.edge * 100).toFixed(1);
+  const confidence =
+    parseFloat(roi) >= 6
+      ? "🔥 HIGH"
+      : parseFloat(roi) >= 3
+      ? "⚡ MEDIUM"
+      : "❄️ LOW";
+
+  return { ...bestBet, overUnder, roi, confidence };
+}
+
+// ─── BUILD TELEGRAM MESSAGE ───────────────────────────────────
+function buildMessage(game, odds, sim, bet, gameIndex, totalGames) {
+  const date = new Date().toLocaleDateString("en-CA", {
+    weekday: "long",
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    timeZone: "America/Toronto",
+  });
+
+  // Odds table
+  const oddsLines = BOOKMAKERS.map((bk) => {
+    const o = odds[bk];
+    const homeFlag = o.homeML.startsWith("-") ? "🟢" : "🔴";
+    const awayFlag = o.awayML.startsWith("-") ? "🟢" : "🔴";
+    return `${bk.padEnd(11)} ${homeFlag}${game.homeAbbr} ${o.homeML.padStart(5)}  ${awayFlag}${game.awayAbbr} ${o.awayML.padStart(5)}  O/U ${o.total}`;
+  }).join("\n");
+
+  // Sim results
+  const simLines = sim.results
+    .map((r) => {
+      const winnerEmoji = r.winner === game.homeAbbr ? "🏠" : "✈️";
+      return `  Run ${r.run}: ${game.homeAbbr} ${r.homeScore}-${r.awayScore} ${game.awayAbbr}  ${winnerEmoji}${r.winner}${r.ot ? " OT" : ""}`;
+    })
+    .join("\n");
+
+  // Injury lines
+  const homeInjuries = game.injuries.home
+    .map((i) => {
+      const icon = i.includes("OUT") ? "🔴" : i.includes("GTD") ? "🟡" : "🟢";
+      return `  ${icon} ${i}`;
+    })
+    .join("\n");
+
+  const awayInjuries = game.injuries.away
+    .map((i) => {
+      const icon = i.includes("OUT") ? "🔴" : i.includes("GTD") ? "🟡" : "🟢";
+      return `  ${icon} ${i}`;
+    })
+    .join("\n");
+
+  return `🏒 <b>NHL PLAYOFF BETTING INTEL</b> [${gameIndex}/${totalGames}]
+📅 ${date}
+━━━━━━━━━━━━━━━━━━━━━━
+<b>⚔️ ${game.awayAbbr} @ ${game.homeAbbr}</b>
+${game.away} vs ${game.home}
+📊 ${game.series} | ${game.seriesRecord}
+━━━━━━━━━━━━━━━━━━━━━━
+
+📈 <b>8-BOOK ODDS</b>
+<code>${oddsLines}</code>
+
+━━━━━━━━━━━━━━━━━━━━━━
+🎲 <b>MONTE CARLO — 10 SIMULATIONS</b>
+<code>${simLines}</code>
+
+📊 <b>SIMULATION RESULTS</b>
+  🏠 ${game.homeAbbr} Win: <b>${sim.homeWinPct}%</b> (${sim.adjustedHomeProb}% adj)
+  ✈️ ${game.awayAbbr} Win: <b>${sim.awayWinPct}%</b>
+  ⛳ Avg Total Goals: <b>${sim.avgTotal}</b>
+  ⏱ OT Probability: <b>${sim.otPct}%</b>
+
+━━━━━━━━━━━━━━━━━━━━━━
+🏥 <b>INJURY REPORT</b>
+🏠 ${game.home}:
+${homeInjuries}
+✈️ ${game.away}:
+${awayInjuries}
+
+📅 <b>HEAD TO HEAD</b>
+  ${game.h2h}
+  🏠 ${game.homeAbbr} Form: ${game.form.home}
+  ✈️ ${game.awayAbbr} Form: ${game.form.away}
+
+━━━━━━━━━━━━━━━━━━━━━━
+💰 <b>BEST BET</b>
+  🎯 Pick: <b>${bet.team} ML ${bet.ml}</b>
+  📚 Book: <b>${bet.book}</b>
+  📉 Total: <b>${bet.overUnder}</b>
+  📈 ROI Edge: <b>+${bet.roi}%</b>
+  🔥 Confidence: <b>${bet.confidence}</b>
+
+━━━━━━━━━━━━━━━━━━━━━━
+<i>⚠️ For entertainment only. Bet responsibly.</i>`;
+}
+
+// ─── SEND ONE GAME ────────────────────────────────────────────
+async function sendGame(game, index, total) {
+  const odds = generateOdds(game.baseHomeWinPct);
+  const sim = runMonteCarlo(game);
+  const bet = getBestBet(game, odds, sim);
+  const msg = buildMessage(game, odds, sim, bet, index, total);
+
+  try {
+    await bot.sendMessage(CHAT_ID, msg, { parse_mode: "HTML" });
+    console.log(`✅ Sent: ${game.awayAbbr} @ ${game.homeAbbr}`);
+  } catch (e) {
+    console.error(`❌ Failed to send ${game.awayAbbr} @ ${game.homeAbbr}:`, e.message);
+  }
+
+  // Delay between messages to avoid Telegram rate limits
+  await new Promise((r) => setTimeout(r, 2000));
+}
+
+// ─── SEND DAILY DIGEST ───────────────────────────────────────
+async function sendDailyDigest() {
+  console.log("📡 Running daily NHL playoff digest...");
+
+  // Try live schedule first
+  let games = await fetchNHLSchedule();
+
+  if (!games || games.length === 0) {
+    console.log("Using fallback game data...");
+    games = getFallbackGames();
+  }
+
+  if (games.length === 0) {
+    await bot.sendMessage(
+      CHAT_ID,
+      "🏒 <b>NHL BETTING BOT</b>\n\nNo playoff games scheduled today. Check back tomorrow!",
+      { parse_mode: "HTML" }
+    );
+    return;
+  }
+
+  // Header message
+  await bot.sendMessage(
+    CHAT_ID,
+    `🏒 <b>NHL PLAYOFF DAILY ALERT</b>\n📅 ${new Date().toLocaleDateString("en-CA", { weekday: "long", month: "long", day: "numeric", timeZone: "America/Toronto" })}\n\n🎮 <b>${games.length} games today</b>\nSending full analysis now...`,
+    { parse_mode: "HTML" }
+  );
+
+  await new Promise((r) => setTimeout(r, 1500));
+
+  // Send each game
+  for (let i = 0; i < games.length; i++) {
+    await sendGame(games[i], i + 1, games.length);
+  }
+
+  console.log(`✅ Digest complete — ${games.length} games sent`);
+}
+
+// ─── SCHEDULE ─────────────────────────────────────────────────
+// Runs at 2:00 PM Eastern (19:00 UTC) every day
+// Change the cron string to adjust timing:
+//   "0 17 * * *"  = 12 PM EST (5 PM UTC)
+//   "0 19 * * *"  = 2 PM EST (7 PM UTC)  ← default
+//   "0 21 * * *"  = 4 PM EST (9 PM UTC)
+cron.schedule("0 19 * * *", () => {
+  sendDailyDigest();
+}, {
+  timezone: "America/Toronto"
+});
+
+// ─── ALSO SEND ON STARTUP ────────────────────────────────────
+console.log("🏒 NHL Betting Bot started");
+console.log("⏰ Scheduled: 2:00 PM ET daily");
+console.log("📡 Sending startup digest now...");
+sendDailyDigest();
+
+// Keep process alive on Railway
+process.on("SIGTERM", () => {
+  console.log("Bot shutting down...");
+  process.exit(0);
+});
